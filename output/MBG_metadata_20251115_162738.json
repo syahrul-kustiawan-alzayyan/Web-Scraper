@@ -1,0 +1,34 @@
+{
+  "scraper": "MBG Twitter Scraper v2.1",
+  "keywords": {
+    "mbg_keywords": [
+      "MBG",
+      "Makan Bergizi Gratis",
+      "makan bergizi",
+      "prabowo makan",
+      "program mbg"
+    ]
+  },
+  "mbg_related_terms": [
+    "makan bergizi",
+    "mbg",
+    "prabowo",
+    "gratis",
+    "anak sekolah",
+    "gizi",
+    "program",
+    "kemendikbud",
+    "kemensos",
+    "kesehatan",
+    "sekolah dasar",
+    "sd",
+    "siswa",
+    "murid",
+    "nutrisi"
+  ],
+  "posts_extracted": 4,
+  "extraction_date": "2025-11-15T16:27:38.349823",
+  "max_posts_requested": 50,
+  "unique_authors": 4,
+  "output_file": "C:\\Users\\ASUS\\Downloads\\mbg_scraper\\output\\MBG_twitter_4_posts_20251115_162738.csv"
+}

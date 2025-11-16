@@ -1,0 +1,20 @@
+{
+  "scraper_info": {
+    "name": "Production MBG Twitter Scraper",
+    "version": "2.0",
+    "target_posts": 1000,
+    "actual_posts": 288,
+    "extraction_date": "2025-11-16T13:32:04.662923",
+    "session_duration": "208.3 seconds",
+    "scroll_attempts": 21,
+    "keywords_used": [
+      "MBG"
+    ],
+    "output_file": "C:\\Users\\ASUS\\Downloads\\mbg_scraper\\output\\MBG_ALL_288_posts_20251116_133204.csv"
+  },
+  "statistics": {
+    "unique_authors": 194,
+    "avg_content_length": 138.12847222222223,
+    "avg_likes": 2.4618055555555554
+  }
+}
