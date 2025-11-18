@@ -20,11 +20,11 @@ except ImportError:
         try:
             with open(keywords_file, 'r', encoding='utf-8') as f:
                 data = json.load(f)
-                KEYWORDS = data.get("mbg_keywords", ["mbg prabowo"])
+                KEYWORDS = data.get("mbg_keywords", ["prabowo makan"])
         except:
-            KEYWORDS = ["mbg prabowo"]
+            KEYWORDS = ["prabowo makan"]
     else:
-        KEYWORDS = ["mbg prabowo"]
+        KEYWORDS = ["prabowo makan"]
 # Import the scraper
 from scrapers.twitter_scraper import ProductionTwitterScraper
 

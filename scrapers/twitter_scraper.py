@@ -27,9 +27,9 @@ from config.settings import (
     MAX_DELAY_BETWEEN_SCROLLS,
     SESSION_RESTART_THRESHOLD,
     MAX_SESSION_DURATION,
-    KEYWORDS
+    KEYWORDS,
+    INDO_REGIONS_FILE
 )
-
 class ProductionTwitterScraper:
     def __init__(self):
         self.driver = None
@@ -38,13 +38,29 @@ class ProductionTwitterScraper:
         self.start_time = None
         self.scroll_attempts = 0
         self.session_posts = 0
-        self.target_keywords = KEYWORDS if KEYWORDS else ["mbg prabowo"]
+        self.target_keywords = KEYWORDS if KEYWORDS else ["prabowo makan"]
         self.session_start_time = None
         self.total_posts_found = 0
         self.keyword_stats = {}
         self.unlimited_mode = True
         self.last_successful_keyword = None
         self.last_successful_post_hash = None
+        self.indonesian_regions = self._load_indonesian_regions()  # Load dari file JSON
+
+    def _load_indonesian_regions(self):
+        """Load daftar provinsi dan kabupaten/kota Indonesia dari file JSON"""
+        try:
+            if not os.path.exists(INDO_REGIONS_FILE):
+                print(f"[WARNING] Indonesian regions file not found at: {INDO_REGIONS_FILE}")
+                return {}
+            
+            with open(INDO_REGIONS_FILE, 'r', encoding='utf-8') as f:
+                regions_data = json.load(f)
+                print(f"[INFO] Successfully loaded Indonesian regions data: {len(regions_data)} provinces")
+                return regions_data
+        except Exception as e:
+            print(f"[ERROR] Failed to load Indonesian regions: {str(e)}")
+            return {}
 
     def _setup_driver(self):
         """Setup Chrome driver dengan opsi untuk mengurangi error GPU"""
@@ -465,6 +481,90 @@ class ProductionTwitterScraper:
         
         # Final scroll to bottom
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
+        
+    def _extract_indonesian_location(self, text):
+        """
+        Ekstrak lokasi kabupaten/kota atau provinsi Indonesia dari teks
+        Menggunakan data dari file JSON yang berisi struktur provinsi -> kabupaten/kota
+        """
+        if not text or not self.indonesian_regions:
+            return "unknown"
+        
+        text_lower = text.lower().replace('.', ' ').replace(',', ' ').replace(';', ' ').replace(':', ' ')
+        found_locations = []
+        
+        # 1. Cari kabupaten/kota terlebih dahulu (prioritas tertinggi)
+        for province, cities in self.indonesian_regions.items():
+            for city in cities:
+                city_lower = city.lower()
+                # Cari kecocokan persis atau sebagai bagian dari teks
+                if city_lower in text_lower or text_lower in city_lower:
+                    # Prioritaskan lokasi yang lebih spesifik
+                    if "kabupaten" in city_lower or "kota" in city_lower or "kab." in text_lower or "kota" in text_lower:
+                        found_locations.insert(0, city)  # Prioritas tertinggi
+                    else:
+                        found_locations.append(city)
+        
+        # 2. Jika tidak ditemukan kabupaten/kota, cari provinsi
+        if not found_locations:
+            for province in self.indonesian_regions.keys():
+                province_lower = province.lower()
+                if province_lower in text_lower or text_lower in province_lower:
+                    found_locations.append(province)
+        
+        # 3. Cari pola umum lokasi
+        if not found_locations:
+            location_patterns = [
+                r'kabupaten\s+([a-z\s]+)',
+                r'kota\s+([a-z\s]+)',
+                r'di\s+([a-z\s]+)',
+                r'provinsi\s+([a-z\s]+)',
+                r'([a-z\s]+)\s+kabupaten',
+                r'([a-z\s]+)\s+kota',
+                r'([a-z\s]+)\s+provinsi',
+                r'([a-z\s]+)\s+indonesia'
+            ]
+            
+            for pattern in location_patterns:
+                matches = re.findall(pattern, text_lower)
+                for match in matches:
+                    if isinstance(match, tuple):
+                        match = match[0] if match else ""
+                    match = str(match).strip()
+                    if match and len(match) > 2:  # Minimal 3 karakter
+                        # Cari kecocokan dengan daftar lokasi
+                        for province, cities in self.indonesian_regions.items():
+                            # Cek apakah match cocok dengan nama kota
+                            for city in cities:
+                                city_lower = city.lower()
+                                if match in city_lower or city_lower in match:
+                                    found_locations.append(city)
+                                    break
+                            else:
+                                # Cek apakah match cocok dengan nama provinsi
+                                province_lower = province.lower()
+                                if match in province_lower or province_lower in match:
+                                    found_locations.append(province)
+                            if found_locations:
+                                break
+        
+        # 4. Return hasil dengan prioritas
+        if found_locations:
+            # 1. Prioritaskan lokasi dengan prefix "kabupaten" atau "kota"
+            for loc in found_locations:
+                if "kabupaten" in loc.lower() or "kota" in loc.lower() or "kab." in loc.lower() or "kotamadya" in loc.lower():
+                    return loc
+            
+            # 2. Prioritaskan lokasi kabupaten/kota (bukan provinsi)
+            for loc in found_locations:
+                for province, cities in self.indonesian_regions.items():
+                    if loc in cities:
+                        return loc
+            
+            # 3. Jika tidak ada yang spesifik, kembalikan lokasi pertama
+            return found_locations[0]
+        
+        return "unknown"
 
     def _extract_new_posts(self, keyword):
         """Ekstrak post baru dengan deduplication dan tagging keyword"""
@@ -518,7 +618,7 @@ class ProductionTwitterScraper:
             return hash(time.time())
 
     def _parse_single_post(self, post, keyword):
-        """Parse single post dengan error handling production"""
+        """Parse single post dengan ekstraksi lokasi dari file JSON"""
         try:
             # Username
             username = "unknown"
@@ -547,6 +647,9 @@ class ProductionTwitterScraper:
             # Skip if content too short
             if not content or len(content) < 5:
                 return None
+            
+            # **EKSTRAKSI LOKASI** menggunakan data dari file JSON
+            location = self._extract_indonesian_location(content)
             
             # Timestamp
             timestamp = datetime.now().isoformat()
@@ -585,6 +688,7 @@ class ProductionTwitterScraper:
                 "search_keyword": keyword,
                 "username": username,
                 "content": content,
+                "location": location,  # Field lokasi dari file JSON
                 "timestamp": timestamp,
                 "likes": likes,
                 "retweets": retweets,
@@ -671,8 +775,8 @@ class ProductionTwitterScraper:
             return None
 
     def save_final_results(self):
-        """Simpan hasil akhir dengan metadata lengkap untuk multi keyword"""
-        if not self.posts_data:  # FIX: posts_ -> posts_data
+        """Simpan hasil akhir dengan metadata lokasi yang lengkap"""
+        if not self.posts_data:
             print("❌ No data to save")
             return False
         
@@ -684,7 +788,7 @@ class ProductionTwitterScraper:
             df = pd.DataFrame(self.posts_data)
             
             # Add metadata columns
-            df['scraper_version'] = "3.1 (UNLIMITED MODE)"
+            df['scraper_version'] = "3.3 (JSON LOCATION DATA)"
             df['extraction_date'] = datetime.now().isoformat()
             df['session_duration'] = f"{time.time() - self.start_time:.1f} seconds"
             df['total_keywords'] = len(self.target_keywords)
@@ -699,10 +803,16 @@ class ProductionTwitterScraper:
                 df.to_json(filepath, orient='records', indent=2, ensure_ascii=False)
             
             # Save metadata
+            location_stats = {}
+            for post in self.posts_data:
+                loc = post.get('location', 'unknown')
+                if loc != 'unknown':
+                    location_stats[loc] = location_stats.get(loc, 0) + 1
+            
             metadata = {
                 "scraper_info": {
-                    "name": "Twitter Scraper (UNLIMITED MODE)",
-                    "version": "3.1",
+                    "name": "Twitter Scraper with JSON Location Data",
+                    "version": "3.3",
                     "mode": "UNLIMITED",
                     "actual_posts": len(self.posts_data),
                     "keywords_used": self.target_keywords,
@@ -713,9 +823,15 @@ class ProductionTwitterScraper:
                     "average_collection_rate": f"{len(self.posts_data)/max(1, (time.time() - self.start_time)):.2f} posts/second",
                     "output_file": filepath
                 },
-                "statistics": {
-                    "unique_authors": len(df['username'].unique()),
-                    "avg_content_length": df['content'].apply(len).mean(),
+                "location_statistics": {
+                    "total_posts_with_location": len([p for p in self.posts_data if p.get('location', 'unknown') != 'unknown']),
+                    "location_distribution": location_stats,
+                    "provinces_mentioned": list(set([province for province in self.indonesian_regions.keys() if any(province.lower() in post.get('location', '').lower() for post in self.posts_data)])),
+                    "cities_mentioned": list(set([city for post in self.posts_data for province, cities in self.indonesian_regions.items() for city in cities if city.lower() in post.get('location', '').lower()]))
+                },
+                "post_statistics": {
+                    "unique_authors": len(set([p.get('username', 'unknown') for p in self.posts_data])),
+                    "avg_content_length": sum(len(p.get('content', '')) for p in self.posts_data) / max(1, len(self.posts_data)),
                     "posts_per_keyword": self.keyword_stats,
                     "total_posts": len(self.posts_data)
                 }
@@ -724,6 +840,12 @@ class ProductionTwitterScraper:
             metadata_file = os.path.join(OUTPUT_FOLDER, f"UNLIMITED_metadata_{timestamp}.json")
             with open(metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
+            
+            print("\n✅ LOCATION STATISTICS:")
+            print(f"   📍 Total posts with location: {metadata['location_statistics']['total_posts_with_location']}/{len(self.posts_data)}")
+            print(f"   🏙️  Unique locations found: {len(metadata['location_statistics']['location_distribution'])}")
+            print(f"   🗺️  Provinces mentioned: {len(metadata['location_statistics']['provinces_mentioned'])}")
+            print(f"   🏘️  Cities/regencies mentioned: {len(metadata['location_statistics']['cities_mentioned'])}")
             
             return True
             
