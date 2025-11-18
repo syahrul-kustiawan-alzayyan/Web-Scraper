@@ -1,31 +1,47 @@
 import sys
 import os
+import json
+from datetime import datetime
 
-# Add project root to Python path
-PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-sys.path.insert(0, PROJECT_ROOT)
+# Get current file directory and project root
+current_file = os.path.abspath(__file__)
+project_root = os.path.dirname(os.path.dirname(current_file))
+sys.path.insert(0, project_root)
 
+# Import settings
+try:
+    from config.settings import KEYWORDS
+except ImportError:
+    # Fallback loading
+    config_dir = os.path.join(project_root, "config")
+    keywords_file = os.path.join(config_dir, "keywords.json")
+    
+    if os.path.exists(keywords_file):
+        try:
+            with open(keywords_file, 'r', encoding='utf-8') as f:
+                data = json.load(f)
+                KEYWORDS = data.get("mbg_keywords", ["mbg prabowo"])
+        except:
+            KEYWORDS = ["mbg prabowo"]
+    else:
+        KEYWORDS = ["mbg prabowo"]
+# Import the scraper
 from scrapers.twitter_scraper import ProductionTwitterScraper
 
 def main():
-    print("🚀 Starting PRODUCTION Twitter Scraper for 1000 MBG Posts")
-    print("=" * 70)
-    print("This will scrape up to 1000 posts containing 'MBG' from Twitter.")
-    print("The process may take 15-30 minutes depending on network speed.")
-    print("DO NOT close the browser window during scraping.")
-    print("-" * 70)
+    """Main execution function"""
+    print("🚀 Twitter Scraper Production Mode")
+    print("=" * 50)
+    print(f"Keywords: {', '.join(KEYWORDS)}")
+    print(f"Start time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 50)
     
-    # Confirm start
-    confirm = input("Do you want to start the production scraper? (yes/no): ").strip().lower()
-    if confirm != 'yes':
-        print("❌ Scraper aborted by user")
-        return
-    
+    # Initialize and run scraper
     scraper = ProductionTwitterScraper()
     scraper.run()
     
-    print("\n✅ PRODUCTION SCRAPER COMPLETED")
-    print("=" * 40)
+    print("\n✅ Session completed")
+    print(f"End time: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
 
 if __name__ == "__main__":
     main()

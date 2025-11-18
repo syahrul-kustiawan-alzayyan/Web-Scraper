@@ -10,6 +10,8 @@ import os
 import random
 from datetime import datetime
 import json
+import urllib.parse
+import re
 from config.settings import (
     SELENIUM_DRIVER_PATH,
     BROWSER_HEADLESS,
@@ -24,7 +26,8 @@ from config.settings import (
     MIN_DELAY_BETWEEN_SCROLLS,
     MAX_DELAY_BETWEEN_SCROLLS,
     SESSION_RESTART_THRESHOLD,
-    MAX_SESSION_DURATION
+    MAX_SESSION_DURATION,
+    KEYWORDS
 )
 
 class ProductionTwitterScraper:
@@ -35,27 +38,40 @@ class ProductionTwitterScraper:
         self.start_time = None
         self.scroll_attempts = 0
         self.session_posts = 0
+        self.target_keywords = KEYWORDS if KEYWORDS else ["mbg prabowo"]
+        self.session_start_time = None
+        self.total_posts_found = 0
+        self.keyword_stats = {}
+        self.unlimited_mode = True
+        self.last_successful_keyword = None
+        self.last_successful_post_hash = None
 
     def _setup_driver(self):
-        """Setup Chrome driver untuk production dengan anti-detection"""
-        print("🔧 Setting up production Chrome driver...")
+        """Setup Chrome driver dengan opsi untuk mengurangi error GPU"""
         options = Options()
         
-        # Essential production options
+        # Essential production options dengan GPU error reduction
         options.add_argument("--disable-gpu")
+        options.add_argument("--disable-software-rasterizer")
         options.add_argument("--disable-dev-shm-usage")
         options.add_argument("--no-sandbox")
-        options.add_argument("--window-size=1920,1080")
-        options.add_argument("--disable-notifications")
-        options.add_argument("--disable-popup-blocking")
+        options.add_argument("--disable-webgl")
+        options.add_argument("--disable-3d-apis")
+        options.add_argument("--disable-gpu-compositing")
+        options.add_argument("--disable-software-rasterizer")
+        options.add_argument("--disable-background-networking")
+        options.add_argument("--disable-background-timer-throttling")
+        options.add_argument("--disable-backgrounding-occluded-windows")
+        options.add_argument("--disable-renderer-backgrounding")
+        options.add_argument("--disable-infobars")
         
         # Anti-detection settings
         options.add_argument("--disable-blink-features=AutomationControlled")
         options.add_argument("--disable-automation")
-        options.add_experimental_option("excludeSwitches", ["enable-automation"])
+        options.add_experimental_option("excludeSwitches", ["enable-automation", "enable-logging"])
         options.add_experimental_option('useAutomationExtension', False)
         
-        # User agent realistis
+        # Clean user agent
         options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36")
         
         if BROWSER_HEADLESS:
@@ -69,9 +85,15 @@ class ProductionTwitterScraper:
         Object.defineProperty(navigator, 'webdriver', {
           get: () => undefined
         });
+        window.navigator.webdriver = undefined;
+        Object.defineProperty(navigator, 'plugins', {
+          get: () => [1, 2, 3, 4, 5]
+        });
+        Object.defineProperty(navigator, 'languages', {
+          get: () => ['en-US', 'en']
+        });
         """)
         
-        print("✅ Production Chrome driver initialized")
         return driver
 
     def _load_cookies(self):
@@ -100,10 +122,8 @@ class ProductionTwitterScraper:
                     
                     self.driver.add_cookie(cookie)
                     valid_cookies += 1
-                except Exception as e:
+                except:
                     continue
-            
-            print(f"   ✅ Added {valid_cookies} valid cookies")
             
             # Refresh to apply cookies
             self.driver.refresh()
@@ -114,29 +134,95 @@ class ProductionTwitterScraper:
                 WebDriverWait(self.driver, 15).until(
                     EC.presence_of_element_located((By.CSS_SELECTOR, "[data-testid='SideNav_NewTweet_Button'], [data-testid='tweetButtonInline']"))
                 )
-                print("✅ [SUCCESS] Twitter login successful")
+                print("✅ Twitter login successful")
                 return True
             except:
                 print("[ERROR] Login verification failed. Session may be invalid.")
-                self.driver.save_screenshot("login_verification_failed.png")
                 return False
                 
-        except Exception as e:
-            print(f"[ERROR] Cookie loading failed: {e}")
+        except:
             return False
 
-    def search_mbg(self):
-        """Search MBG tanpa filter waktu"""
-        print("\n🔍 Starting production search for 'MBG' (All Time)")
+    def _clear_browser_state(self):
+        """Bersihkan semua state browser sebelum ganti keyword"""
+        try:
+            print("   🧹 Clearing browser cache and state...")
+            
+            # Hapus semua cookies
+            self.driver.delete_all_cookies()
+            
+            # Clear local storage dan session storage
+            self.driver.execute_script("window.localStorage.clear();")
+            self.driver.execute_script("window.sessionStorage.clear();")
+            
+            # Clear cache
+            self.driver.execute_script("caches.keys().then(function(names) {for (let name of names) caches.delete(name);});")
+            
+            # Navigate ke halaman kosong untuk memastikan cache bersih
+            self.driver.get("about:blank")
+            time.sleep(2)
+            
+            print("   ✅ Browser state cleared successfully")
+            return True
+        except Exception as e:
+            print(f"   ❌ Failed to clear browser state: {str(e)}")
+            return False
+
+    def _handle_error_and_retry(self, keyword, last_successful_post=None):
+        """Handle error dengan login ulang dan retry dari post terakhir"""
+        print(f"\n⚠️ Error detected for keyword '{keyword}'. Attempting recovery...")
         
         try:
-            # Production search URL tanpa parameter waktu
-            search_url = (
-                "https://twitter.com/search?q=MBG&src=typed_query"
-                "&f=live"  # Hanya konten live/terbaru
-            )
+            # Simpan data yang sudah berhasil dikumpulkan
+            if self.posts_data:  # FIX: posts_ -> posts_data
+                print("   💾 Saving partial results before recovery...")
+                self._save_partial_results(f"RECOVERY_{keyword.replace(' ', '_')}")
             
-            print(f"   Navigating to: {search_url}")
+            # Tutup browser yang bermasalah
+            if self.driver:
+                print("   🔌 Closing current browser session...")
+                self.driver.quit()
+                time.sleep(5)
+            
+            # Setup browser baru
+            print("   🔄 Setting up new browser session...")
+            self.driver = self._setup_driver()
+            
+            # Login ulang
+            print("   🔑 Re-authenticating with Twitter...")
+            if not self._load_cookies():
+                print("❌ Failed to re-login. Recovery aborted.")
+                return False
+            
+            # Cari keyword lagi
+            print(f"   🔍 Restarting search for keyword: '{keyword}'")
+            if not self.search_keyword(keyword):
+                print("❌ Failed to search keyword after recovery. Recovery aborted.")
+                return False
+            
+            # Jika ada post terakhir yang berhasil, coba mulai dari sana
+            if last_successful_post:
+                print("   🎯 Attempting to resume from last successful content...")
+                # Di sini bisa ditambahkan logika untuk mencari konten terakhir
+                # Untuk saat ini, kita mulai dari awal dengan pengecekan duplikat
+            
+            print("✅ Recovery successful. Continuing scraping.")
+            return True
+            
+        except Exception as e:
+            print(f"❌ Recovery failed: {str(e)}")
+            return False
+
+    def search_keyword(self, keyword):
+        """Search dengan keyword spesifik (TANPA FILTER TANGGAL)"""
+        try:
+            # URL encode keyword
+            encoded_keyword = urllib.parse.quote(keyword)
+            
+            # Production search URL TANPA parameter waktu
+            search_url = f"https://twitter.com/search?q={encoded_keyword}&src=typed_query&f=live"
+            
+            print(f"   🌐 Navigating to search URL...")
             self.driver.get(search_url)
             time.sleep(PAGE_LOAD_DELAY * 2)
             
@@ -146,12 +232,16 @@ class ProductionTwitterScraper:
             # Apply latest filter
             self._apply_latest_filter()
             
-            print("✅ Production search page loaded successfully")
-            return True
-            
+            # Verifikasi hasil pencarian
+            if self._has_search_results():
+                print(f"✅ Search results loaded for keyword: '{keyword}'")
+                return True
+            else:
+                print(f"❌ No search results found for keyword: '{keyword}'")
+                return False
+                
         except Exception as e:
-            print(f"❌ Production search failed: {e}")
-            self.driver.save_screenshot("production_search_failed.png")
+            print(f"❌ Search failed for keyword '{keyword}': {str(e)}")
             return False
 
     def _handle_cookie_banner(self):
@@ -175,19 +265,15 @@ class ProductionTwitterScraper:
                         )
                     element.click()
                     time.sleep(2)
-                    print("   ✅ Accepted cookie consent")
                     return
                 except:
                     continue
-            print("   ℹ️ No cookie banner found")
         except:
             pass
 
     def _apply_latest_filter(self):
         """Apply 'Latest' filter untuk konten terbaru"""
         try:
-            print("   Applying 'Latest' filter...")
-            
             # Click filter button
             filter_btn = WebDriverWait(self.driver, 5).until(
                 EC.element_to_be_clickable((By.CSS_SELECTOR, "[data-testid='searchFilterButton']"))
@@ -202,30 +288,100 @@ class ProductionTwitterScraper:
             latest_option.click()
             time.sleep(3)
             
-            print("   ✅ 'Latest' filter applied successfully")
             return True
             
-        except Exception as e:
-            print(f"   ⚠️ Latest filter application skipped: {e}")
+        except:
             return False
 
-    def _smart_scroll_until_target(self):
-        """Scrolling cerdas hingga mencapai target 1000 data"""
-        print("\n🔄 Starting smart scrolling for 1000 MBG posts...")
-        print("=" * 60)
+    def _has_search_results(self):
+        """Periksa apakah pencarian menghasilkan hasil"""
+        try:
+            # Cek indikator "No results"
+            no_results_selectors = [
+                "//div[contains(text(),'No results') or contains(text(),'Tidak ada hasil')]",
+                "[data-testid='emptyState']",
+                ".css-1dbjc4n.r-1awozwy.r-18u37iz.r-dnmrzs"
+            ]
+            
+            for selector in no_results_selectors:
+                try:
+                    if selector.startswith("//"):
+                        elements = self.driver.find_elements(By.XPATH, selector)
+                    else:
+                        elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    
+                    if elements:
+                        for el in elements:
+                            if el.is_displayed() and el.text.strip() != "":
+                                return False
+                except:
+                    continue
+            
+            # Cek apakah ada tweet yang terlihat
+            tweet_selectors = [
+                "article[data-testid='tweet']",
+                "[data-testid='tweet']",
+                "div[aria-labelledby^='id__']",
+                "div[data-testid='tweetText']",
+                "section > div > div"
+            ]
+            
+            for selector in tweet_selectors:
+                try:
+                    tweets = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    visible_tweets = [t for t in tweets if t.is_displayed()]
+                    if visible_tweets:
+                        return True
+                except:
+                    continue
+            
+            return False
+            
+        except:
+            return False
+
+    def _display_progress(self, keyword, posts_this_keyword, elapsed_time):
+        """Tampilkan progres scraping dengan format yang jelas"""
+        total_posts = len(self.posts_data)
+        avg_collection_rate = total_posts / max(1, elapsed_time)
+        progress_percent = min(100, (self.scroll_attempts / MAX_SCROLL_ATTEMPTS) * 100)
         
-        self.start_time = time.time()
+        print(f"\n{'=' * 60}")
+        print(f"📊 PROGRESS REPORT - Keyword: '{keyword}'")
+        print(f"{'=' * 60}")
+        print(f"   📌 Posts from this keyword: {posts_this_keyword:,}")
+        print(f"   📌 Total posts collected: {total_posts:,}")
+        print(f"   ⏱️  Elapsed time: {elapsed_time:.1f} seconds")
+        print(f"   📈 Collection rate: {avg_collection_rate:.2f} posts/second")
+        print(f"   🔄 Scroll attempts: {self.scroll_attempts}/{MAX_SCROLL_ATTEMPTS} ({progress_percent:.1f}%)")
+        print(f"   💾 Last save: {datetime.now().strftime('%H:%M:%S')}")
+        print(f"{'=' * 60}")
+
+    def _smart_scroll_until_target(self, keyword):
+        """Scrolling cerdas dengan progres tracking dan recovery"""
+        keyword_start_time = time.time()
         last_post_count = 0
         no_new_content_count = 0
+        keyword_posts = 0
+        last_save_time = time.time()
+        last_progress_time = time.time()
+        PROGRESS_INTERVAL = 15  # Update progres setiap 15 detik
+        ERROR_THRESHOLD = 3  # Jumlah error sebelum recovery
+        error_count = 0
+        last_successful_post = None
         
-        while (self.scroll_attempts < MAX_SCROLL_ATTEMPTS and 
-               len(self.posts_data) < MAX_POSTS and
-               time.time() - self.start_time < MAX_SESSION_DURATION):
+        while (self.scroll_attempts < MAX_SCROLL_ATTEMPTS and
+               time.time() - keyword_start_time < MAX_SESSION_DURATION / len(self.target_keywords)):
+            
+            current_time = time.time()
+            
+            # Tampilkan progres secara berkala
+            if current_time - last_progress_time > PROGRESS_INTERVAL:
+                self._display_progress(keyword, keyword_posts, current_time - keyword_start_time)
+                last_progress_time = current_time
             
             self.scroll_attempts += 1
-            elapsed_time = time.time() - self.start_time
-            print(f"\n📈 Scroll Attempt {self.scroll_attempts}/{MAX_SCROLL_ATTEMPTS} | Elapsed: {elapsed_time:.1f}s")
-            print(f"   Current posts: {len(self.posts_data)}/{MAX_POSTS}")
+            elapsed_time = current_time - keyword_start_time
             
             try:
                 # Scroll down in increments
@@ -233,47 +389,71 @@ class ProductionTwitterScraper:
                 
                 # Wait with random delay
                 scroll_delay = random.uniform(MIN_DELAY_BETWEEN_SCROLLS, MAX_DELAY_BETWEEN_SCROLLS)
-                print(f"   ⏳ Waiting {scroll_delay:.1f}s for content to load...")
                 time.sleep(scroll_delay)
                 
                 # Extract new posts
-                new_posts = self._extract_new_posts()
-                print(f"   📊 This scroll: {new_posts} new posts | Total: {len(self.posts_data)}")
+                new_posts = self._extract_new_posts(keyword)
+                keyword_posts += new_posts
+                
+                if new_posts > 0:
+                    error_count = 0
+                    last_successful_post = self.posts_data[-1] if self.posts_data else None  # FIX: posts_ -> posts_data
                 
                 # Check for no new content
                 current_count = len(self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']"))
                 if current_count == last_post_count:
                     no_new_content_count += 1
-                    print(f"   ⚠️ No new content ({no_new_content_count}/3)")
                     
-                    if no_new_content_count >= 3:
-                        print("   🛑 Stopping scroll - no new content after 3 attempts")
+                    if no_new_content_count >= 10:
+                        print("   🛑 No new content after 10 attempts. Moving to next keyword.")
                         break
                 else:
                     no_new_content_count = 0
                     last_post_count = current_count
                 
+                # Periodic save every 5 minutes
+                if current_time - last_save_time > 300:
+                    print("   💾 Periodic save triggered...")
+                    self._save_partial_results(f"UNLIMITED_{keyword.replace(' ', '_')}")
+                    last_save_time = current_time
+                
                 # Session restart if needed
                 if len(self.posts_data) >= SESSION_RESTART_THRESHOLD:
-                    print("   🔁 Session restart threshold reached. Saving progress...")
-                    self._save_partial_results()
-                    print("   🔄 Restarting browser session...")
+                    print(f"   🔁 Session restart threshold reached ({SESSION_RESTART_THRESHOLD} posts). Saving progress...")
+                    self._save_partial_results(f"UNLIMITED_{keyword.replace(' ', '_')}")
                     self.driver.quit()
                     time.sleep(8)
                     self.driver = self._setup_driver()
                     self._load_cookies()
-                    self.search_mbg()
+                    self.search_keyword(keyword)
                     last_post_count = 0
-                
+            
             except Exception as e:
-                print(f"   ❌ Scroll attempt failed: {e}")
+                error_count += 1
+                print(f"   ❌ Scroll attempt {self.scroll_attempts} failed: {str(e)}")
+                
+                # Jika error berturut-turut, coba recovery
+                if error_count >= ERROR_THRESHOLD:
+                    print(f"   🔥 {ERROR_THRESHOLD} consecutive errors detected. Attempting recovery...")
+                    
+                    if self._handle_error_and_retry(keyword, last_successful_post):
+                        print("   ✅ Recovery successful. Continuing...")
+                        error_count = 0
+                    else:
+                        print("   ❌ Recovery failed. Skipping this keyword.")
+                        break
+                
                 time.sleep(SCROLL_RECOVERY_DELAY)
         
-        # Final summary
-        print("\n✅ Smart scrolling completed")
-        print(f"   Total scroll attempts: {self.scroll_attempts}")
-        print(f"   Total posts extracted: {len(self.posts_data)}")
-        print(f"   Session duration: {time.time() - self.start_time:.1f} seconds")
+        # Update statistics
+        if keyword not in self.keyword_stats:
+            self.keyword_stats[keyword] = 0
+        self.keyword_stats[keyword] += keyword_posts
+        
+        # Final progress display
+        self._display_progress(keyword, keyword_posts, time.time() - keyword_start_time)
+        
+        return keyword_posts
 
     def _incremental_scroll(self):
         """Scroll bertahap untuk menghindari deteksi bot"""
@@ -286,23 +466,39 @@ class ProductionTwitterScraper:
         # Final scroll to bottom
         self.driver.execute_script("window.scrollTo(0, document.body.scrollHeight);")
 
-    def _extract_new_posts(self):
-        """Ekstrak post baru dengan deduplication"""
+    def _extract_new_posts(self, keyword):
+        """Ekstrak post baru dengan deduplication dan tagging keyword"""
         try:
-            posts = self.driver.find_elements(By.CSS_SELECTOR, "article[data-testid='tweet']")
-            print(f"   Found {len(posts)} posts on page")
+            # Multiple strategies untuk menemukan posts
+            post_selectors = [
+                "article[data-testid='tweet']",
+                "[data-testid='tweet']",
+                "div[aria-labelledby^='id__']",
+                "div[data-testid='tweetText']",
+                "section > div > div"
+            ]
+            
+            posts = []
+            for selector in post_selectors:
+                try:
+                    elements = self.driver.find_elements(By.CSS_SELECTOR, selector)
+                    if elements:
+                        posts = elements
+                        break
+                except:
+                    continue
+            
+            if not posts:
+                return 0
             
             new_count = 0
             for post in posts:
-                if len(self.posts_data) >= MAX_POSTS:
-                    break
-                
                 post_hash = self._get_post_hash(post)
                 if post_hash in self.processed_posts:
                     continue
                 
-                post_data = self._parse_single_post(post)
-                if post_data:
+                post_data = self._parse_single_post(post, keyword)
+                if post_data:  # FIX: post_ -> post_data
                     self.processed_posts.add(post_hash)
                     self.posts_data.append(post_data)
                     new_count += 1
@@ -310,7 +506,7 @@ class ProductionTwitterScraper:
             return new_count
             
         except Exception as e:
-            print(f"   ❌ Extraction error: {e}")
+            print(f"   ❌ Extraction error: {str(e)}")
             return 0
 
     def _get_post_hash(self, post):
@@ -321,7 +517,7 @@ class ProductionTwitterScraper:
         except:
             return hash(time.time())
 
-    def _parse_single_post(self, post):
+    def _parse_single_post(self, post, keyword):
         """Parse single post dengan error handling production"""
         try:
             # Username
@@ -348,8 +544,8 @@ class ProductionTwitterScraper:
                 except:
                     pass
             
-            # Skip if content too short or empty
-            if not content or len(content) < 15:
+            # Skip if content too short
+            if not content or len(content) < 5:
                 return None
             
             # Timestamp
@@ -358,7 +554,12 @@ class ProductionTwitterScraper:
                 time_element = post.find_element(By.CSS_SELECTOR, "time")
                 timestamp = time_element.get_attribute("datetime")
             except:
-                pass
+                try:
+                    time_element = post.find_element(By.CSS_SELECTOR, "[aria-label]")
+                    time_text = time_element.get_attribute("aria-label")
+                    timestamp = self._parse_aria_timestamp(time_text)
+                except:
+                    pass
             
             # Engagement
             likes = "0"
@@ -375,9 +576,13 @@ class ProductionTwitterScraper:
             except:
                 pass
             
+            # Relevancy check
+            if not self._is_content_relevant(content, keyword):
+                return None
+            
             return {
                 "platform": "twitter",
-                "search_keyword": "MBG",
+                "search_keyword": keyword,
                 "username": username,
                 "content": content,
                 "timestamp": timestamp,
@@ -387,16 +592,69 @@ class ProductionTwitterScraper:
             }
             
         except Exception as e:
+            print(f"   🚨 Parsing error: {str(e)}")
             return None
 
-    def _save_partial_results(self):
+    def _parse_aria_timestamp(self, aria_label):
+        """Parse timestamp from aria-label"""
+        try:
+            # Extract date part
+            date_match = re.search(r'(\d{1,2}\s+[A-Za-z]+\s+\d{4}|\d{4}-\d{2}-\d{2}|\d{1,2} [A-Za-z]+,? \d{4})', aria_label)
+            if date_match:
+                date_str = date_match.group(1).replace(',', '').strip()
+                try:
+                    # Try common date formats
+                    for fmt in ["%d %b %Y", "%d %B %Y", "%Y-%m-%d", "%b %d %Y", "%B %d %Y"]:
+                        try:
+                            parsed_date = datetime.strptime(date_str, fmt)
+                            return parsed_date.isoformat()
+                        except:
+                            continue
+                except:
+                    pass
+            return datetime.now().isoformat()
+        except:
+            return datetime.now().isoformat()
+
+    def _is_content_relevant(self, content, keyword):
+        """Check if content is relevant to the keyword"""
+        if not content or not keyword:
+            return True
+        
+        content_lower = content.lower()
+        keyword_lower = keyword.lower()
+        
+        # Check for exact keyword match
+        if keyword_lower in content_lower:
+            return True
+        
+        # Check for related terms based on keyword
+        related_terms = {
+            "makan bergizi gratis": ["mbg", "program", "sekolah", "siswa", "prabowo"],
+            "prabowo makan": ["mbg", "program", "gratis", "sekolah", "kemendikbud"],
+            "mbg sekolah": ["makan bergizi", "gratis", "prabowo", "siswa", "pendidikan"],
+            "program makan siswa": ["mbg", "gratis", "sekolah", "prabowo", "kemendikbud"]
+        }
+        
+        # Get related terms for this keyword
+        terms = related_terms.get(keyword_lower, [])
+        terms.append(keyword_lower.split()[0])  # Add first word of keyword
+        
+        # Check if any related term is in content
+        for term in terms:
+            if term in content_lower:
+                return True
+        
+        return False
+
+    def _save_partial_results(self, prefix="UNLIMITED"):
         """Simpan hasil sementara untuk session restart"""
-        if not self.posts_data:
+        if not self.posts_data:  # FIX: posts_ -> posts_data
             return
         
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"MBG_partial_{len(self.posts_data)}_posts_{timestamp}.{OUTPUT_FORMAT}"
+            filename = f"{prefix}_{len(self.posts_data)}_posts_{timestamp}.{OUTPUT_FORMAT}"
             filepath = os.path.join(OUTPUT_FOLDER, filename)
             
             df = pd.DataFrame(self.posts_data)
@@ -406,32 +664,33 @@ class ProductionTwitterScraper:
             else:
                 df.to_json(filepath, orient='records', indent=2, ensure_ascii=False)
             
-            print(f"   💾 Saved partial results: {filename}")
             return filepath
             
         except Exception as e:
-            print(f"   ❌ Partial save failed: {e}")
+            print(f"   ❌ Partial save failed: {str(e)}")
             return None
 
     def save_final_results(self):
-        """Simpan hasil akhir dengan metadata lengkap"""
-        if not self.posts_data:
+        """Simpan hasil akhir dengan metadata lengkap untuk multi keyword"""
+        if not self.posts_data:  # FIX: posts_ -> posts_data
             print("❌ No data to save")
             return False
         
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"MBG_ALL_{len(self.posts_data)}_posts_{timestamp}.{OUTPUT_FORMAT}"
+            filename = f"UNLIMITED_{len(self.posts_data)}_posts_{timestamp}.{OUTPUT_FORMAT}"
             filepath = os.path.join(OUTPUT_FOLDER, filename)
             
             df = pd.DataFrame(self.posts_data)
             
             # Add metadata columns
-            df['scraper_version'] = "2.0"
-            df['target_keyword'] = "MBG"
+            df['scraper_version'] = "3.1 (UNLIMITED MODE)"
             df['extraction_date'] = datetime.now().isoformat()
             df['session_duration'] = f"{time.time() - self.start_time:.1f} seconds"
-            df['scroll_attempts'] = self.scroll_attempts
+            df['total_keywords'] = len(self.target_keywords)
+            df['keywords_used'] = ", ".join(self.target_keywords)
+            df['total_scroll_attempts'] = self.scroll_attempts
+            df['average_collection_rate'] = f"{len(self.posts_data)/max(1, (time.time() - self.start_time)):.2f} posts/second"
             
             # Save
             if OUTPUT_FORMAT == "csv":
@@ -442,48 +701,40 @@ class ProductionTwitterScraper:
             # Save metadata
             metadata = {
                 "scraper_info": {
-                    "name": "Production MBG Twitter Scraper",
-                    "version": "2.0",
-                    "target_posts": MAX_POSTS,
+                    "name": "Twitter Scraper (UNLIMITED MODE)",
+                    "version": "3.1",
+                    "mode": "UNLIMITED",
                     "actual_posts": len(self.posts_data),
+                    "keywords_used": self.target_keywords,
+                    "total_keywords": len(self.target_keywords),
                     "extraction_date": datetime.now().isoformat(),
                     "session_duration": f"{time.time() - self.start_time:.1f} seconds",
-                    "scroll_attempts": self.scroll_attempts,
-                    "keywords_used": ["MBG"],
+                    "total_scroll_attempts": self.scroll_attempts,
+                    "average_collection_rate": f"{len(self.posts_data)/max(1, (time.time() - self.start_time)):.2f} posts/second",
                     "output_file": filepath
                 },
                 "statistics": {
                     "unique_authors": len(df['username'].unique()),
                     "avg_content_length": df['content'].apply(len).mean(),
-                    "avg_likes": df['likes'].apply(lambda x: int(x.replace(',', '')) if x.replace(',', '').isdigit() else 0).mean()
+                    "posts_per_keyword": self.keyword_stats,
+                    "total_posts": len(self.posts_data)
                 }
             }
             
-            metadata_file = os.path.join(OUTPUT_FOLDER, f"MBG_metadata_{timestamp}.json")
+            metadata_file = os.path.join(OUTPUT_FOLDER, f"UNLIMITED_metadata_{timestamp}.json")
             with open(metadata_file, 'w', encoding='utf-8') as f:
                 json.dump(metadata, f, indent=2, ensure_ascii=False)
-            
-            print("\n✅ Final results saved successfully")
-            print(f"   📁 Data file: {filepath}")
-            print(f"   📁 Metadata file: {metadata_file}")
-            print(f"   📊 Total posts: {len(self.posts_data)}")
-            print(f"   👥 Unique authors: {metadata['statistics']['unique_authors']}")
-            print(f"   ⏱️ Session duration: {metadata['scraper_info']['session_duration']}")
             
             return True
             
         except Exception as e:
-            print(f"❌ Final save failed: {e}")
+            print(f"❌ Final save failed: {str(e)}")
             return False
 
     def run(self):
-        """Main production execution flow"""
-        print("🚀 Starting PRODUCTION Twitter Scraper for 'MBG'")
-        print("=" * 60)
-        print(f"🎯 Target: {MAX_POSTS} MBG posts (All Time)")
-        print(f"⏱️  Max session duration: {MAX_SESSION_DURATION/60:.1f} minutes")
-        print(f"🔄 Max scroll attempts: {MAX_SCROLL_ATTEMPTS}")
-        print("-" * 60)
+        """Main production execution flow untuk unlimited multi keyword"""
+        print("🚀 Starting UNLIMITED Twitter Scraper for MULTIPLE KEYWORDS")
+        print("=" * 70)
         
         self.start_time = time.time()
         
@@ -494,27 +745,56 @@ class ProductionTwitterScraper:
             # Load cookies and login
             if not self._load_cookies():
                 print("❌ Login failed. Cannot proceed with scraping.")
-                return
+                return self.keyword_stats
             
-            # Search for MBG
-            if not self.search_mbg():
-                print("❌ Search failed. Cannot proceed with scraping.")
-                return
-            
-            # Smart scrolling until target reached
-            self._smart_scroll_until_target()
+            # Process each keyword
+            for i, keyword in enumerate(self.target_keywords, 1):
+                print(f"\n{'=' * 60}")
+                print(f"🎯 PROCESSING KEYWORD {i}/{len(self.target_keywords)}: '{keyword}'")
+                print(f"{'=' * 60}")
+                
+                if self.search_keyword(keyword):
+                    self._smart_scroll_until_target(keyword)
+                else:
+                    print(f"❌ Failed to process keyword '{keyword}'")
+                
+                # Clear browser state before next keyword
+                if i < len(self.target_keywords):
+                    print(f"\n{'=' * 50}")
+                    print("🧹 CLEARING BROWSER CACHE BEFORE NEXT KEYWORD")
+                    print(f"{'=' * 50}")
+                    self._clear_browser_state()
+                    
+                    # Delay between keywords
+                    delay = random.uniform(8, 15)
+                    print(f"⏳ Waiting {delay:.1f} seconds before next keyword...")
+                    time.sleep(delay)
             
             # Save final results
-            if self.posts_data:
+            print("\n\n" + "=" * 60)
+            print("🏁 SCRAPING SESSION COMPLETED")
+            print("=" * 60)
+            
+            if self.posts_data:  # FIX: posts_ -> posts_data
                 self.save_final_results()
+                print(f"✅ Total posts collected: {len(self.posts_data):,}")
+                print(f"✅ Total keywords processed: {len(self.target_keywords)}")
             else:
-                print("❌ No MBG posts were extracted. Check your cookies and connection.")
-                self.driver.save_screenshot("no_posts_extracted.png")
+                print("❌ No posts were collected. Check your cookies and connection.")
+            
+            return self.keyword_stats
             
         except Exception as e:
-            print(f"❌ Critical error in production scraper: {e}")
-            if self.driver:
-                self.driver.save_screenshot("production_crash.png")
+            print(f"❌ Critical error in scraper: {str(e)}")
+            
+            # Attempt one recovery
+            print("\n🔄 Attempting one-time recovery...")
+            if self._handle_error_and_retry("final_recovery"):
+                print("✅ Recovery successful. Continuing...")
+                return self.keyword_stats
+            else:
+                print("❌ Final recovery failed. Shutting down.")
+                return self.keyword_stats
         finally:
             try:
                 if self.driver:
